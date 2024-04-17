@@ -2,10 +2,15 @@ use cosmic::app::{command, Core};
 
 use cosmic::cctk::sctk::reexports::protocols::wp::presentation_time::client::wp_presentation_feedback::Kind;
 use cosmic::iced::advanced::subscription;
+use cosmic::iced::wayland::actions::layer_surface::SctkLayerSurfaceSettings;
 use cosmic::iced::wayland::popup::{destroy_popup, get_popup};
 use cosmic::iced::window::Id;
 use cosmic::iced::{self, event, Command, Limits};
-
+use cosmic::iced_core::{Length, Color, Border, alignment, Shadow, color};
+use cosmic::iced_sctk::commands::layer_surface::{destroy_layer_surface, KeyboardInteractivity, Anchor, get_layer_surface};
+use cosmic::iced_widget::graphics::color;
+use cosmic::prelude::CollectionWidget;
+use cosmic::widget;
 use cosmic::iced_futures::Subscription;
 use cosmic::iced_runtime::command::Action;
 use cosmic::iced_runtime::core::window;
@@ -19,7 +24,7 @@ use cosmic::{Element, Theme};
 use crate::config::{Config, CONFIG_VERSION, PRIVATE_MODE};
 use crate::db::{self, Data, Db};
 use crate::message::AppMessage;
-use crate::utils::command_message;
+use crate::utils::{command_message, formated_value};
 use crate::view::{popup_view, quick_settings_view};
 use crate::{clipboard, config, navigation};
 
@@ -34,6 +39,7 @@ pub struct Window {
     config_handler: Option<cosmic_config::Config>,
     popup: Option<Popup>,
     state: AppState,
+    wayland_popup: Option<Id>,
 }
 
 pub struct AppState {
@@ -176,6 +182,7 @@ impl cosmic::Application for Window {
                 more_action: None,
             },
             config,
+            wayland_popup: None,
         };
 
         #[cfg(debug_assertions)]
@@ -302,6 +309,24 @@ impl cosmic::Application for Window {
             AppMessage::MoreAction(data) => {
                 self.state.more_action = data;
             }
+            AppMessage::CloseWaylandPopup => {
+                if let Some(id) = self.wayland_popup.take() {
+                    return destroy_layer_surface(id);
+                }
+            }
+            AppMessage::ActivateWaylandPopup => {
+                let id = window::Id::unique();
+                self.wayland_popup.replace(id);
+                return get_layer_surface(SctkLayerSurfaceSettings {
+                    id,
+                    keyboard_interactivity: KeyboardInteractivity::OnDemand,
+                    anchor: Anchor::all(),
+                    namespace: "clibpard indicator".into(),
+                    size: Some((None, None)),
+                    size_limits: Limits::NONE.min_width(1.0).min_height(1.0),
+                    ..Default::default()
+                });
+            }
         }
         Command::none()
     }
@@ -318,23 +343,107 @@ impl cosmic::Application for Window {
             .into()
     }
 
-    fn view_window(&self, _id: Id) -> Element<Self::Message> {
+    fn view_window(&self, id: Id) -> Element<Self::Message> {
         //dbg!(&_id, &self.popup);
 
-        let Some(popup) = &self.popup else {
-            return self
-                .core
-                .applet
-                .popup_container(popup_view(&self.state, &self.config))
-                .into();
-        };
+        return if matches!(&self.popup, Some(p) if p.id == id) {
+            let view = match self.popup.as_ref().unwrap().kind {
+                PopupKind::Popup => popup_view(&self.state, &self.config),
+                PopupKind::QuickSettings => quick_settings_view(&self.state, &self.config),
+            };
+            self.core.applet.popup_container(view).into()
+        } else if matches!(self.wayland_popup, Some(p) if p == id) {
+            let mut content = widget::row::with_capacity(10).spacing(10);
 
-        let view = match &popup.kind {
-            PopupKind::Popup => popup_view(&self.state, &self.config),
-            PopupKind::QuickSettings => quick_settings_view(&self.state, &self.config),
-        };
+            for entry in self.state.db.iter().take(10) {
+                let content_group = content_group(&entry.value);
+                let container;
+                match content_group {
+                    ContentGroup::Color(hex) => {
+                        let color = convert_color(hex);
+                        let txt = widget::text(format!("#{:0>6x}", hex));
+                        let txt_container = widget::container(txt)
+                            .center_x()
+                            .center_y()
+                            .padding(10)
+                            .style(cosmic::theme::Container::custom(move |_theme| {
+                                widget::container::Appearance {
+                                    background: Some(Color::BLACK.into()),
+                                    ..Default::default()
+                                }
+                            }));
 
-        self.core.applet.popup_container(view).into()
+                        container = widget::container(txt_container)
+                            .center_x()
+                            .center_y()
+                            .style(cosmic::theme::Container::custom(move |_theme| {
+                                widget::container::Appearance {
+                                    background: Some(color.into()),
+                                    ..Default::default()
+                                }
+                            }));
+                    }
+                    ContentGroup::Emoji(emoji) => {
+                        container =
+                            widget::container(widget::text(emoji).size(40).width(70).height(70))
+                                .center_x()
+                                .center_y()
+                                .style(cosmic::theme::Container::custom(move |_theme| {
+                                    widget::container::Appearance {
+                                        background: Some(color!(0xfca903).into()),
+                                        ..Default::default()
+                                    }
+                                }));
+                    }
+                    ContentGroup::Text(text) => {
+                        container = widget::container(widget::text(text)).style(
+                            cosmic::theme::Container::custom(move |_theme| {
+                                widget::container::Appearance {
+                                    background: Some(color!(0x994e15).into()),
+                                    ..Default::default()
+                                }
+                            }),
+                        );
+                    }
+                }
+
+                content = content.push(container.width(250).height(250));
+            }
+
+            widget::mouse_area(
+                widget::container(
+                    widget::container(content)
+                        /*
+                        .style(cosmic::theme::Container::custom(|theme| {
+                            widget::container::Appearance {
+                                icon_color: Some(theme.cosmic().background.on.into()),
+                                text_color: Some(theme.cosmic().background.on.into()),
+                                background: Some(Color::from(theme.cosmic().secondary.base).into()),
+                                // border: Border {
+                                //     radius: 12.0.into(),
+                                //     width: 2.0,
+                                //     color: theme.cosmic().bg_divider().into(),
+                                // },
+                                shadow: Shadow::default(),
+                                ..Default::default()
+                            }
+                        }))
+                        */
+                        .width(Length::Fill)
+                        .height(Length::Shrink),
+                )
+                .align_x(alignment::Horizontal::Center)
+                .align_y(alignment::Vertical::Bottom)
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
+            .on_press(AppMessage::CloseWaylandPopup)
+            .on_right_press(AppMessage::CloseWaylandPopup)
+            .on_middle_press(AppMessage::CloseWaylandPopup)
+            .into()
+        } else {
+            widget::text("").into()
+        };
     }
     fn subscription(&self) -> Subscription<Self::Message> {
         let mut subscriptions = vec![config::sub(), navigation::sub().map(AppMessage::Navigation)];
@@ -349,4 +458,45 @@ impl cosmic::Application for Window {
     fn style(&self) -> Option<<Theme as application::StyleSheet>::Style> {
         Some(cosmic::applet::style())
     }
+}
+
+fn content_group(content: &str) -> ContentGroup {
+    let content_trim = content.trim();
+    if content_trim.is_ascii() && content_trim.len() <= 9 {
+        let color_value = content_trim.strip_prefix('#').unwrap_or(content_trim);
+        if let Ok(mut color) = u32::from_str_radix(color_value, 16) {
+            if color_value.len() == 3 {
+                color = convert_short_color(color)
+            }
+            return ContentGroup::Color(color);
+        }
+    }
+    if let Some(emoji) = emojis::get(content_trim) {
+        return ContentGroup::Emoji(emoji.as_str().into());
+    }
+    return ContentGroup::Text(content.into());
+}
+fn convert_color(hex: u32) -> Color {
+    let has_alpha = hex > 0x00ffffff;
+    let alpha = if has_alpha { 8 } else { 0 };
+    let r = (hex >> (16 + alpha)) & 0xff;
+    let g = (hex >> (8 + alpha)) & 0xff;
+    let b = (hex >> (alpha)) & 0xff;
+    if has_alpha {
+        let a = hex & 0xff;
+        return Color::from_rgba8(r as _, g as _, b as _, a as f32 / 255.0);
+    }
+    return Color::from_rgb8(r as _, g as _, b as _);
+}
+fn convert_short_color(hex: u32) -> u32 {
+    let r = (hex >> 8) & 0xf;
+    let g = (hex >> 4) & 0xf;
+    let b = hex & 0xf;
+    return (r << 20) | (r << 16) | (g << 12) | (g << 8) | (b << 4) | b;
+}
+
+enum ContentGroup {
+    Color(u32),
+    Emoji(String),
+    Text(String),
 }
